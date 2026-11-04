@@ -1,16 +1,23 @@
 """Deterministic tools the agents use. No LLM calls in this file.
 
 Part A: files and tests (local, no network).
-Part B (next step): git and GitHub.
+Part B: git and GitHub.
 """
 
+import base64
 import os
 import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
+
+from dotenv import load_dotenv
+from github import Auth, Github
+
+load_dotenv()
 
 MAX_OUTPUT_CHARS = 4000  # pytest output sent back to the coder is trimmed to save tokens
 TEST_TIMEOUT_SECONDS = 120
@@ -22,9 +29,11 @@ class ToolError(RuntimeError):
 
 # ---------- helpers ----------
 
-def run_cmd(args: list[str], cwd: Path, timeout: int = 120) -> subprocess.CompletedProcess:
+def run_cmd(
+    args: list[str], cwd: Path, timeout: int = 120, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     """Run a command without a shell (args as a list, so nothing gets shell-interpreted)."""
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})}
     return subprocess.run(
         args,
         cwd=cwd,
@@ -206,10 +215,153 @@ def evaluate_against_baseline(
     return Verdict(False, "; ".join(parts), _trim("\n\n".join(details)))
 
 
-if __name__ == "__main__":
-    # Smoke test: python -m agent.tools workspace/textutils
-    repo = Path(sys.argv[1] if len(sys.argv) > 1 else "workspace/textutils")
+# =====================================================================
+# Part B: git and GitHub
+# =====================================================================
 
+WORKSPACE_DIR = Path(os.getenv("WORKSPACE_DIR", "./workspace"))
+AGENT_GIT_NAME = os.getenv("AGENT_GIT_NAME", "autonomous-dev-agent")
+AGENT_GIT_EMAIL = os.getenv("AGENT_GIT_EMAIL", "autonomous-dev-agent@users.noreply.github.com")
+
+
+def _github_token() -> str:
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise ToolError("Missing GITHUB_TOKEN in .env")
+    return token
+
+
+def _basic_auth() -> str:
+    return base64.b64encode(f"x-access-token:{_github_token()}".encode()).decode()
+
+
+def _redact(text: str) -> str:
+    """Never let the token (raw or base64) end up in an error message or a log."""
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        text = text.replace(token, "***").replace(_basic_auth(), "***")
+    return text
+
+
+def _git(repo_path: Path, *args: str, network: bool = False) -> str:
+    """Run a git command and return stdout. Raises ToolError (token redacted) on failure.
+
+    For network commands the token is passed as a one-off HTTP header scoped to
+    github.com, so it is never written into .git/config or the remote URL.
+    """
+    cmd = ["git"]
+    if network:
+        cmd += [
+            "-c", "credential.helper=",  # don't let a credential manager pop up a login window
+            "-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {_basic_auth()}",
+        ]
+    cmd += list(args)
+    # GIT_TERMINAL_PROMPT=0: fail with an error instead of hanging on a password prompt
+    result = run_cmd(cmd, cwd=repo_path, timeout=180, extra_env={"GIT_TERMINAL_PROMPT": "0"})
+    if result.returncode != 0:
+        raise ToolError(_redact(f"git {args[0]} failed: {result.stderr.strip() or result.stdout.strip()}"))
+    return result.stdout
+
+
+def _clone_url(repo_full_name: str) -> str:
+    return f"https://github.com/{repo_full_name}.git"
+
+
+def _normalize_url(url: str) -> str:
+    return url.strip().lower().removesuffix("/").removesuffix(".git")
+
+
+def prepare_workspace(repo_full_name: str, default_branch: str) -> Path:
+    """Clone the repo (first run) or reset it to a clean copy of the remote default branch.
+
+    Every run starts from exactly what's on GitHub, so leftovers from a failed run
+    can never leak into the next one.
+    """
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    dest = (WORKSPACE_DIR / repo_full_name.split("/")[-1]).resolve()
+    url = _clone_url(repo_full_name)
+
+    if not (dest / ".git").exists():
+        _git(WORKSPACE_DIR, "clone", url, str(dest), network=True)
+    else:
+        origin = _git(dest, "remote", "get-url", "origin").strip()
+        if _normalize_url(origin) != _normalize_url(url):
+            raise ToolError(f"{dest} is a clone of {origin}, not {url}. Remove it and retry.")
+        _git(dest, "fetch", "origin", "--prune", network=True)
+
+    _git(dest, "checkout", "-f", "-B", default_branch, f"origin/{default_branch}")
+    _git(dest, "clean", "-fdx")
+    return dest
+
+
+def create_branch(repo_path: Path, branch: str, base: str) -> None:
+    """Create (or reset) a local branch from the remote base branch."""
+    _git(repo_path, "checkout", "-f", "-B", branch, f"origin/{base}")
+
+
+def commit_files(repo_path: Path, files: list[str], message: str) -> str:
+    """Stage exactly these files (never `git add -A`) and commit. Returns the commit SHA."""
+    _git(repo_path, "add", "--", *files)
+    if not _git(repo_path, "diff", "--cached", "--name-only").strip():
+        raise ToolError("Nothing to commit: the changes are identical to the base branch.")
+    _git(
+        repo_path,
+        "-c", f"user.name={AGENT_GIT_NAME}",
+        "-c", f"user.email={AGENT_GIT_EMAIL}",
+        "commit", "-m", message,
+    )
+    return _git(repo_path, "rev-parse", "HEAD").strip()
+
+
+def push_branch(repo_path: Path, branch: str, default_branch: str) -> None:
+    """Push the agent's branch. Force is allowed only because agent/* branches belong to the agent."""
+    if branch == default_branch or not branch.startswith("agent/"):
+        raise ToolError(f"Refusing to push to {branch!r}: the agent only pushes agent/* branches.")
+    _git(repo_path, "push", "--force", "-u", "origin", branch, network=True)
+
+
+# ---------- GitHub API ----------
+
+@dataclass
+class IssueInfo:
+    number: int
+    title: str
+    body: str
+    url: str
+
+
+@lru_cache(maxsize=1)
+def _github() -> Github:
+    return Github(auth=Auth.Token(_github_token()), timeout=30)
+
+
+def get_default_branch(repo_full_name: str) -> str:
+    return _github().get_repo(repo_full_name).default_branch
+
+
+def fetch_issue(repo_full_name: str, number: int) -> IssueInfo:
+    issue = _github().get_repo(repo_full_name).get_issue(number=number)
+    if issue.pull_request is not None:
+        raise ToolError(f"#{number} is a pull request, not an issue.")
+    if issue.state != "open":
+        raise ToolError(f"Issue #{number} is {issue.state}; nothing to fix.")
+    return IssueInfo(number=number, title=issue.title, body=issue.body or "", url=issue.html_url)
+
+
+def find_open_pr(repo_full_name: str, branch: str) -> str | None:
+    """Return the URL of an open PR from this branch, if one exists."""
+    owner = repo_full_name.split("/")[0]
+    for pr in _github().get_repo(repo_full_name).get_pulls(state="open", head=f"{owner}:{branch}"):
+        return pr.html_url
+    return None
+
+
+def open_pull_request(repo_full_name: str, head: str, base: str, title: str, body: str) -> str:
+    pr = _github().get_repo(repo_full_name).create_pull(title=title, body=body, head=head, base=base)
+    return pr.html_url
+
+
+def _smoke_local(repo: Path) -> None:
     files = list_files(repo)
     print("files:", files)
     print("read_file ok:", read_file(repo, "textutils/numbers.py").splitlines()[0])
@@ -228,3 +380,38 @@ if __name__ == "__main__":
     print(f"evaluate unchanged code for issue #2 -> passed={verdict.passed}: {verdict.summary}")
     print("--- feedback the coder would get ---")
     print(verdict.feedback)
+
+
+def _smoke_github(repo_full_name: str, issue_number: int) -> None:
+    default_branch = get_default_branch(repo_full_name)
+    print("default branch:", default_branch)
+
+    issue = fetch_issue(repo_full_name, issue_number)
+    print(f"issue #{issue.number}: {issue.title}")
+
+    repo = prepare_workspace(repo_full_name, default_branch)
+    print("workspace:", repo)
+    print("HEAD:", _git(repo, "log", "-1", "--oneline").strip())
+    print("clean:", not _git(repo, "status", "--porcelain").strip())
+
+    # Check push permission without leaving anything behind:
+    # push a temporary branch pointing at the current commit, then delete it.
+    check_branch = "agent/permission-check"
+    _git(repo, "push", "origin", f"HEAD:refs/heads/{check_branch}", network=True)
+    _git(repo, "push", "origin", "--delete", check_branch, network=True)
+    print("push permission: ok (temporary branch created and deleted)")
+
+    print("open PR for agent/issue-%d:" % issue_number, find_open_pr(repo_full_name, f"agent/issue-{issue_number}"))
+
+
+if __name__ == "__main__":
+    # Smoke tests:
+    #   python -m agent.tools local workspace/textutils
+    #   python -m agent.tools github alisha-mund/textutils 2
+    mode = sys.argv[1] if len(sys.argv) > 1 else "local"
+    if mode == "local":
+        _smoke_local(Path(sys.argv[2] if len(sys.argv) > 2 else "workspace/textutils"))
+    elif mode == "github":
+        _smoke_github(sys.argv[2], int(sys.argv[3]))
+    else:
+        sys.exit("usage: python -m agent.tools [local <repo_path> | github <owner/repo> <issue>]")
