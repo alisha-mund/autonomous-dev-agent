@@ -4,7 +4,8 @@ setup     (no LLM)  fetch issue, clean workspace, record baseline test failures,
 planner   (LLM)     issue + source code -> Plan
 coder     (LLM)     plan + current files (+ test feedback on retries) -> full new file contents
 reviewer  (no LLM)  run the test suite and compare against the baseline
-give_up   (no LLM)  record a failed run after MAX_ATTEMPTS (no PR)
+give_up     (no LLM)  record a failed run after MAX_ATTEMPTS (no PR)
+pr_creator  (no LLM)  commit, push the agent branch, open a PR linked to the issue
 """
 
 import functools
@@ -18,6 +19,7 @@ from agent.llm import structured_call
 from agent.state import MAX_ATTEMPTS, AgentState, CodeChange, Plan
 
 MAX_SOURCE_CHARS = 40_000  # cap on source code sent to the planner (cost + context guard)
+AGENT_REPO_URL = "https://github.com/alisha-mund/autonomous-dev-agent"
 
 
 # ---------- logging + error handling shared by all nodes ----------
@@ -137,6 +139,7 @@ def planner(state: AgentState) -> dict:
     dropped = [t for t in plan.test_files if t not in covering]
     if covering:
         plan.test_files = covering
+
     return {
         "plan": plan,
         "logs": [_entry("planner", status="ok", plan=plan.model_dump(), dropped_test_files=dropped,
@@ -215,6 +218,7 @@ def reviewer(state: AgentState) -> dict:
                         failed_total=len(run.failed), total=run.total)],
     }
 
+
 # ---------- give_up (deterministic) ----------
 
 @traced("give_up")
@@ -225,6 +229,80 @@ def give_up(state: AgentState) -> dict:
         "logs": [_entry("give_up", status="failed", attempts=attempts,
                         last_feedback=state.get("test_output", "")[:2000])],
     }
+
+
+# ---------- pr_creator (deterministic) ----------
+
+def _pr_body(state: AgentState, diffstat: str) -> str:
+    plan: Plan = state["plan"]
+    change: CodeChange = state["code_change"]
+    logs = state.get("logs", [])
+    reviews = [e for e in logs if e.get("step") == "reviewer"]
+    llm_calls = [e for e in logs if "prompt_tokens" in e]
+    tokens_in = sum(e["prompt_tokens"] for e in llm_calls)
+    tokens_out = sum(e["completion_tokens"] for e in llm_calls)
+    still_failing_elsewhere = reviews[-1].get("failed_total", 0) if reviews else 0
+
+    attempt_lines = "\n".join(
+        f"| {e.get('attempt')} | {e.get('status')} | {e.get('summary')} |" for e in reviews
+    )
+    return f"""## Summary
+Fixes #{state['issue_number']}: {state['issue_title']}
+
+**Root cause:** {plan.root_cause}
+
+**Change:** {change.explanation}
+
+## Verification
+- Target tests ({', '.join(plan.test_files)}): passing
+- Regression check: no test that passed on `{state['default_branch']}` fails on this branch
+- Unrelated failures left untouched (other open issues): {still_failing_elsewhere}
+
+| Attempt | Result | Details |
+|---|---|---|
+{attempt_lines}
+
+## Files changed
+```
+{diffstat}
+```
+
+<details><summary>Agent run details</summary>
+
+- Plan steps:
+{chr(10).join(f"  - {s}" for s in plan.steps)}
+- LLM calls: {len(llm_calls)} ({tokens_in:,} input / {tokens_out:,} output tokens)
+
+</details>
+
+---
+Opened automatically by [autonomous-dev-agent]({AGENT_REPO_URL}). Please review before merging.
+"""
+
+
+@traced("pr_creator")
+def pr_creator(state: AgentState) -> dict:
+    repo = Path(state["repo_path"])
+    number = state["issue_number"]
+    title = f"Fix #{number}: {state['issue_title']}"
+
+    diffstat = tools.run_cmd(["git", "diff", "--stat"], cwd=repo).stdout.strip("\n")
+    sha = tools.commit_files(
+        repo, state["plan"].files_to_change, f"{title}\n\n{state['code_change'].explanation}"
+    )
+    tools.push_branch(repo, state["branch_name"], state["default_branch"])
+    url = tools.open_pull_request(
+        state["repo_full_name"],
+        head=state["branch_name"],
+        base=state["default_branch"],
+        title=title,
+        body=_pr_body(state, diffstat),
+    )
+    return {
+        "pr_url": url,
+        "logs": [_entry("pr_creator", status="ok", commit=sha[:7], branch=state["branch_name"], pr_url=url)],
+    }
+
 
 if __name__ == "__main__":
     # Smoke test: one pass through setup -> planner -> coder -> reviewer, no graph, no push.
