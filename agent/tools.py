@@ -102,6 +102,25 @@ def write_file(repo_path: Path, rel_path: str, content: str) -> None:
     with open(target, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
 
+def _module_name(rel_path: str) -> str:
+    """'textutils/text_stats.py' -> 'textutils.text_stats'."""
+    return Path(rel_path).with_suffix("").as_posix().replace("/", ".")
+
+
+def tests_covering(repo_path: Path, test_files: list[str], source_files: list[str]) -> list[str]:
+    """Keep only the test files that import at least one of the source modules being changed.
+
+    The planner picks test files by name (it never sees test code). This check reads the
+    test files in code, so an unrelated test file can't become a target by accident.
+    """
+    patterns = []
+    for src in source_files:
+        dotted = _module_name(src)
+        parent, _, leaf = dotted.rpartition(".")
+        patterns += [dotted, f"import {leaf}"]
+        if parent:
+            patterns.append(f"from {parent} import {leaf}")
+    return [t for t in test_files if any(p in read_file(repo_path, t) for p in patterns)]
 
 # ---------- tests ----------
 

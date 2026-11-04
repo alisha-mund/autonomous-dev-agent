@@ -4,6 +4,7 @@ setup     (no LLM)  fetch issue, clean workspace, record baseline test failures,
 planner   (LLM)     issue + source code -> Plan
 coder     (LLM)     plan + current files (+ test feedback on retries) -> full new file contents
 reviewer  (no LLM)  run the test suite and compare against the baseline
+give_up   (no LLM)  record a failed run after MAX_ATTEMPTS (no PR)
 """
 
 import functools
@@ -14,7 +15,7 @@ from typing import Any, Callable
 
 from agent import tools
 from agent.llm import structured_call
-from agent.state import AgentState, CodeChange, Plan
+from agent.state import MAX_ATTEMPTS, AgentState, CodeChange, Plan
 
 MAX_SOURCE_CHARS = 40_000  # cap on source code sent to the planner (cost + context guard)
 
@@ -96,8 +97,9 @@ concrete fix plan for a separate coding agent.
 
 Rules:
 - files_to_change: existing SOURCE files that must be edited. Never test files. Usually one file.
-- test_files: existing test files (pick from the file list) that exercise the affected code.
-  You cannot see test contents; choose by file and module name.
+- test_files: the test file(s) for the module(s) in files_to_change, picked from the file list.
+  Usually exactly one, named after the module (e.g. tests/test_<module>.py). Do not include
+  tests for unrelated modules. You cannot see test contents; choose by file and module name.
 - steps: concrete edits (which function, what to change). No large code blocks.
 - Fix only what the issue describes. Do not refactor unrelated code."""
 
@@ -130,9 +132,14 @@ def planner(state: AgentState) -> dict:
     if not plan.test_files:
         raise tools.ToolError("Planner chose no valid test files to verify the fix.")
 
+    # The planner guesses test files by name; keep only those that really import the changed code.
+    covering = tools.tests_covering(repo, plan.test_files, plan.files_to_change)
+    dropped = [t for t in plan.test_files if t not in covering]
+    if covering:
+        plan.test_files = covering
     return {
         "plan": plan,
-        "logs": [_entry("planner", status="ok", plan=plan.model_dump(),
+        "logs": [_entry("planner", status="ok", plan=plan.model_dump(), dropped_test_files=dropped,
                         prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens)],
     }
 
@@ -208,6 +215,16 @@ def reviewer(state: AgentState) -> dict:
                         failed_total=len(run.failed), total=run.total)],
     }
 
+# ---------- give_up (deterministic) ----------
+
+@traced("give_up")
+def give_up(state: AgentState) -> dict:
+    attempts = state.get("attempts", 0)
+    return {
+        "error": f"Tests still failing after {attempts} attempt(s) (max {MAX_ATTEMPTS}); no PR opened.",
+        "logs": [_entry("give_up", status="failed", attempts=attempts,
+                        last_feedback=state.get("test_output", "")[:2000])],
+    }
 
 if __name__ == "__main__":
     # Smoke test: one pass through setup -> planner -> coder -> reviewer, no graph, no push.
