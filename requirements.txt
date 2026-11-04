@@ -1,0 +1,6 @@
+langgraph>=1.0
+openai>=3.0
+pydantic>=2.7
+PyGithub>=2.4
+python-dotenv>=1.0
+pytest>=8.0
