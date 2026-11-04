@@ -46,9 +46,11 @@ class AgentState(TypedDict, total=False):
     issue_number: int
     issue_title: str
     issue_body: str
+    issue_url: str 
 
     # Workspace
     repo_path: str               # local clone the agents work in
+    default_branch: str          # e.g. "main" (read from GitHub, not assumed)
     branch_name: str             # e.g. "agent/issue-2"
     baseline_failures: list[str] # test IDs already failing on main before any change
 
