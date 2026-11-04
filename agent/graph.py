@@ -12,6 +12,7 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
+from agent import run_log
 from agent.nodes import coder, give_up, planner, pr_creator, reviewer, setup
 from agent.state import MAX_ATTEMPTS, AgentState
 
@@ -77,19 +78,28 @@ def _summarize(node: str, update: dict[str, Any]) -> str:
 
 
 def run(repo_full_name: str, issue_number: int, dry_run: bool = False, verbose: bool = True) -> dict[str, Any]:
-    """Run the pipeline for one issue and return the final state."""
+    """Run the pipeline for one issue, write a JSON run record, and return the record."""
     graph = build_graph(dry_run)
-    initial: AgentState = {"repo_full_name": repo_full_name, "issue_number": issue_number, "logs": []}
+    initial: AgentState = {
+        "repo_full_name": repo_full_name, "issue_number": issue_number, "dry_run": dry_run, "logs": [],
+    }
     final: dict[str, Any] = dict(initial)
+    started = run_log.now()
 
-    for mode, data in graph.stream(initial, {"recursion_limit": RECURSION_LIMIT},
-                                   stream_mode=["updates", "values"]):
-        if mode == "updates" and verbose:
-            for node, update in data.items():
-                print(_summarize(node, update))
-        elif mode == "values":
-            final = data
-    return final
+    try:
+        for mode, data in graph.stream(initial, {"recursion_limit": RECURSION_LIMIT},
+                                       stream_mode=["updates", "values"]):
+            if mode == "updates" and verbose:
+                for node, update in data.items():
+                    print(_summarize(node, update))
+            elif mode == "values":
+                final = data
+    except Exception as exc:  # e.g. recursion limit hit: still write a record of what happened
+        final = {**final, "error": f"graph: {exc}"}
+
+    record = run_log.build_record(final, started, run_log.now(), dry_run)
+    record["log_file"] = str(run_log.write_record(record))
+    return record
 
 
 if __name__ == "__main__":
@@ -100,9 +110,9 @@ if __name__ == "__main__":
         print(build_graph().get_graph().draw_mermaid())
         sys.exit()
 
-    state = run(sys.argv[1], int(sys.argv[2]), dry_run=True)
-    attempts = state.get("attempts", 0)
-    if state.get("error"):
-        print(f"\nRESULT: FAILED after {attempts} attempt(s): {state['error']}")
-    else:
-        print(f"\nRESULT: tests pass after {attempts} attempt(s) (dry run: nothing pushed).")
+    rec = run(sys.argv[1], int(sys.argv[2]), dry_run=True)
+    print(f"\nRESULT: {rec['outcome']} after {rec['attempts']} attempt(s) | "
+          f"{rec['prompt_tokens'] + rec['completion_tokens']:,} tokens, ~${rec['estimated_cost_usd']:.4f}")
+    if rec["error"]:
+        print("ERROR:", rec["error"])
+    print("log:", rec["log_file"])

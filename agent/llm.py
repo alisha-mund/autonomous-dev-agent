@@ -51,6 +51,7 @@ def _temperature() -> float | None:
     raw = os.getenv("LLM_TEMPERATURE", "").strip()
     return float(raw) if raw else None
 
+
 def _reasoning_effort() -> str | None:
     """Return LLM_REASONING_EFFORT (e.g. 'minimal', 'low'), or None to not send it.
 
@@ -59,6 +60,7 @@ def _reasoning_effort() -> str | None:
     """
     raw = os.getenv("LLM_REASONING_EFFORT", "").strip().lower()
     return raw or None
+
 
 @lru_cache(maxsize=1)
 def get_client() -> OpenAI:
@@ -80,6 +82,13 @@ def get_client() -> OpenAI:
     raise RuntimeError(f"Unknown LLM_PROVIDER: {_provider()!r} (use 'azure' or 'openai')")
 
 
+def estimate_cost_usd(prompt_tokens: int, completion_tokens: int) -> float:
+    """Rough cost from list prices in .env (USD per 1M tokens). Defaults are gpt-5-mini's."""
+    price_in = float(os.getenv("LLM_PRICE_INPUT_PER_M", "0.25"))
+    price_out = float(os.getenv("LLM_PRICE_OUTPUT_PER_M", "2.00"))
+    return (prompt_tokens * price_in + completion_tokens * price_out) / 1_000_000
+
+
 def get_model_name() -> str:
     """On Azure the 'model' argument is your deployment name, not the model name."""
     if _provider() == "azure":
@@ -93,10 +102,9 @@ def structured_call(system: str, user: str, schema: type[T]) -> tuple[T, Usage]:
     temperature = _temperature()
     if temperature is not None:
         extra["temperature"] = temperature
-
-    reasoning_effort = _reasoning_effort()
-    if reasoning_effort is not None:
-        extra["reasoning_effort"] = reasoning_effort
+    effort = _reasoning_effort()
+    if effort is not None:
+        extra["reasoning_effort"] = effort
 
     completion = get_client().chat.completions.parse(
         model=get_model_name(),
@@ -131,6 +139,7 @@ if __name__ == "__main__":
         user="Say 'pong' and pick the number 42.",
         schema=Ping,
     )
-    print(f"provider={_provider()} model={get_model_name()} temperature={_temperature()}")
+    print(f"provider={_provider()} model={get_model_name()} "
+          f"temperature={_temperature()} reasoning_effort={_reasoning_effort()}")
     print(result)
     print(f"tokens: {usage.prompt_tokens} in / {usage.completion_tokens} out")

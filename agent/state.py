@@ -44,9 +44,10 @@ class AgentState(TypedDict, total=False):
     # Input
     repo_full_name: str          # e.g. "alisha-mund/textutils"
     issue_number: int
+    dry_run: bool                # True = run everything except commit/push/PR
     issue_title: str
     issue_body: str
-    issue_url: str 
+    issue_url: str
 
     # Workspace
     repo_path: str               # local clone the agents work in

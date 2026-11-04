@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent import tools
-from agent.llm import structured_call
+from agent.llm import estimate_cost_usd, structured_call
 from agent.state import MAX_ATTEMPTS, AgentState, CodeChange, Plan
 
 MAX_SOURCE_CHARS = 40_000  # cap on source code sent to the planner (cost + context guard)
@@ -67,9 +67,11 @@ def setup(state: AgentState) -> dict:
     default_branch = tools.get_default_branch(repo_name)
     issue = tools.fetch_issue(repo_name, number)
 
-    existing_pr = tools.find_open_pr(repo_name, branch)
-    if existing_pr:
-        raise tools.ToolError(f"An open PR already exists for this issue: {existing_pr}")
+    # Dry runs push nothing, so an existing PR doesn't matter (and evaluation can rerun any issue).
+    if not state.get("dry_run"):
+        existing_pr = tools.find_open_pr(repo_name, branch)
+        if existing_pr:
+            raise tools.ToolError(f"An open PR already exists for this issue: {existing_pr}")
 
     repo = tools.prepare_workspace(repo_name, default_branch)
     baseline = tools.run_tests(repo)
@@ -271,7 +273,8 @@ Fixes #{state['issue_number']}: {state['issue_title']}
 
 - Plan steps:
 {chr(10).join(f"  - {s}" for s in plan.steps)}
-- LLM calls: {len(llm_calls)} ({tokens_in:,} input / {tokens_out:,} output tokens)
+- LLM calls: {len(llm_calls)} ({tokens_in:,} input / {tokens_out:,} output tokens,
+  ~${estimate_cost_usd(tokens_in, tokens_out):.4f})
 
 </details>
 
